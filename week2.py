@@ -1,0 +1,145 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Load Week 1 combined sold dataset
+sold = pd.read_csv("CombinedSold.csv", low_memory=False)
+
+# Inspect dataset structure
+print("Rows and columns:", sold.shape)
+print("\nColumn names:")
+print(sold.columns.tolist())
+
+print("\nData types:")
+print(sold.dtypes)
+
+print("\nFirst 5 rows:")
+print(sold.head())
+
+# Document unique property types found
+print("\nUnique property types found:")
+print(sold["PropertyType"].unique())
+
+print("\nProperty type counts:")
+print(sold["PropertyType"].value_counts(dropna=False))
+
+# Filter logic: keep Residential records only
+print("\nRows before Residential filter:", len(sold))
+
+sold = sold[sold["PropertyType"] == "Residential"]
+
+print("Rows after Residential filter:", len(sold))
+
+# Missing value analysis
+missing_report = pd.DataFrame({
+    "Missing Count": sold.isnull().sum(),
+    "Missing Percent": sold.isnull().mean() * 100
+})
+
+missing_report = missing_report.sort_values(
+    by="Missing Percent",
+    ascending=False
+)
+
+print("\nMissing value report:")
+print(missing_report)
+
+# Flag columns with more than 90% missing values
+high_missing = missing_report[
+    missing_report["Missing Percent"] > 90
+]
+
+print("\nColumns with more than 90% missing values:")
+print(high_missing)
+
+# Save missing value reports
+missing_report.to_csv("missing_value_report.csv")
+high_missing.to_csv("high_missing_columns_over_90.csv")
+
+# Numeric distribution summary
+numeric_fields = [
+    "ClosePrice",
+    "LivingArea",
+    "DaysOnMarket"
+]
+
+# Make sure numeric fields are treated as numbers
+for col in numeric_fields:
+    sold[col] = pd.to_numeric(sold[col], errors="coerce")
+
+distribution_summary = sold[numeric_fields].describe(
+    percentiles=[0.01, 0.05, 0.25, 0.50, 0.75, 0.95, 0.99]
+)
+
+print("\nNumeric distribution summary:")
+print(distribution_summary)
+
+distribution_summary.to_csv("numeric_distribution_summary.csv")
+
+# Average and median close prices
+print("\nClosePrice average:", sold["ClosePrice"].mean())
+print("ClosePrice median:", sold["ClosePrice"].median())
+
+# Days on Market distribution
+print("\nDaysOnMarket summary:")
+print(sold["DaysOnMarket"].describe())
+
+# Homes sold above vs below list price
+if "ListPrice" in sold.columns:
+    sold["ListPrice"] = pd.to_numeric(sold["ListPrice"], errors="coerce")
+
+    valid_prices = sold.dropna(subset=["ClosePrice", "ListPrice"])
+
+    above_list = (valid_prices["ClosePrice"] > valid_prices["ListPrice"]).mean() * 100
+    below_list = (valid_prices["ClosePrice"] < valid_prices["ListPrice"]).mean() * 100
+    equal_list = (valid_prices["ClosePrice"] == valid_prices["ListPrice"]).mean() * 100
+
+    print("\nPercent sold above list price:", above_list)
+    print("Percent sold below list price:", below_list)
+    print("Percent sold at list price:", equal_list)
+
+# Date consistency check
+if "CloseDate" in sold.columns and "ListingContractDate" in sold.columns:
+    sold["CloseDate"] = pd.to_datetime(sold["CloseDate"], errors="coerce")
+    sold["ListingContractDate"] = pd.to_datetime(
+        sold["ListingContractDate"],
+        errors="coerce"
+    )
+
+    date_issues = sold[
+        sold["CloseDate"] < sold["ListingContractDate"]
+    ]
+
+    print("\nDate consistency issues:")
+    print("CloseDate before ListingContractDate:", len(date_issues))
+
+# County median prices
+if "CountyOrParish" in sold.columns:
+    county_prices = sold.groupby("CountyOrParish")["ClosePrice"].median()
+    county_prices = county_prices.sort_values(ascending=False)
+
+    print("\nCounties with highest median ClosePrice:")
+    print(county_prices)
+
+    county_prices.to_csv("county_median_close_prices.csv")
+
+# Histograms and boxplots
+for col in numeric_fields:
+    plt.figure()
+    sold[col].dropna().hist(bins=40)
+    plt.title(f"Histogram of {col}")
+    plt.xlabel(col)
+    plt.ylabel("Frequency")
+    plt.savefig(f"{col}_histogram.png")
+    plt.close()
+
+    plt.figure()
+    sold.boxplot(column=col)
+    plt.title(f"Boxplot of {col}")
+    plt.ylabel(col)
+    plt.savefig(f"{col}_boxplot.png")
+    plt.close()
+
+# Save filtered dataset
+sold.to_csv("CombinedSold_Validated.csv", index=False)
+
+print("\nDone. Week 2-3 files saved.")

@@ -21,10 +21,8 @@ Transformations and rationale
 * contract_to_close_days = CloseDate - PurchaseContractDate
   Measures escrow / closing period duration.
 * school_district_name
-  Uses the best available district field already present in the MLS data. The
-  handbook references California School District Areas 2024-25 for coordinate-
-  based enrichment; boundary joins require a local geospatial boundary file and
-  geospatial libraries, which are documented in the generated work report.
+  Derived from each property's Latitude and Longitude using the California
+  School District Areas 2024-25 boundary file.
 
 Outputs
 -------
@@ -38,6 +36,8 @@ Week6_PropertyType_Summary.csv
     Segment summary grouped by PropertyType and PropertySubType.
 Week6_OfficeCompetitiveSummary.csv
     Listing-office competitive summary for later Tableau analysis.
+Week6_SchoolDistrict_Summary.csv
+    School-district segment summary from boundary-enriched fields.
 Week6_DataTypeConfirmations.csv
     Data type confirmation for engineered fields.
 Week6_WorkReport.md
@@ -48,8 +48,17 @@ from __future__ import annotations
 
 from pathlib import Path
 import argparse
+import json
 
 import pandas as pd
+
+try:
+    from shapely.geometry import Point, shape
+    from shapely.strtree import STRtree
+except ImportError:  # pragma: no cover - reported clearly at runtime.
+    Point = None
+    STRtree = None
+    shape = None
 
 
 DATE_COLUMNS = [
@@ -78,6 +87,13 @@ ENGINEERED_COLUMNS = [
     "listing_to_contract_days",
     "contract_to_close_days",
     "school_district_name",
+    "school_district_type",
+    "school_district_county",
+    "school_district_cdcode",
+    "school_district_match_count",
+    "elementary_school_district_boundary",
+    "high_school_district_boundary",
+    "unified_school_district_boundary",
     "school_district_source",
 ]
 
@@ -91,6 +107,11 @@ REQUIRED_COLUMNS = [
     "ListOfficeName",
     "BuyerOfficeName",
 ]
+
+SCHOOL_DISTRICT_BOUNDARY_URL = (
+    "https://gis.data.ca.gov/api/download/v1/items/"
+    "b0e3b936426a47ce9d9a2e77e2bb86cc/geojson?layers=0"
+)
 
 
 def require_columns(frame: pd.DataFrame) -> None:
@@ -116,7 +137,154 @@ def first_non_null_text(frame: pd.DataFrame, columns: list[str]) -> pd.Series:
     return result
 
 
-def add_engineered_metrics(frame: pd.DataFrame) -> pd.DataFrame:
+def load_school_district_boundaries(boundary_path: Path) -> list[dict[str, object]]:
+    """Load CA school district polygons and required attributes."""
+    if not boundary_path.exists():
+        raise FileNotFoundError(
+            "School district boundary file not found: "
+            f"{boundary_path}. Download it from {SCHOOL_DISTRICT_BOUNDARY_URL}"
+        )
+    if Point is None or STRtree is None or shape is None:
+        raise ImportError(
+            "shapely is required for the school district boundary join. "
+            "Install it with: python -m pip install shapely"
+        )
+
+    with boundary_path.open(encoding="utf-8") as boundary_file:
+        geojson = json.load(boundary_file)
+
+    boundaries = []
+    for feature in geojson.get("features", []):
+        properties = feature.get("properties", {})
+        boundaries.append(
+            {
+                "geometry": shape(feature.get("geometry")),
+                "DistrictName": properties.get("DistrictName"),
+                "DistrictType": properties.get("DistrictType"),
+                "CountyName": properties.get("CountyName"),
+                "CDCode": properties.get("CDCode"),
+            }
+        )
+    return boundaries
+
+
+def choose_primary_district(matches: list[dict[str, object]]) -> dict[str, object] | None:
+    """Prefer Unified districts, then Elementary, then High for one display field."""
+    if not matches:
+        return None
+
+    priority = {"Unified": 0, "Elementary": 1, "High": 2}
+    return sorted(
+        matches,
+        key=lambda item: (
+            priority.get(str(item.get("DistrictType")), 99),
+            str(item.get("DistrictName")),
+        ),
+    )[0]
+
+
+def add_school_district_boundaries(
+    data: pd.DataFrame,
+    boundary_path: Path,
+) -> pd.DataFrame:
+    """Spatially enrich records with CA school district boundary attributes."""
+    boundaries = load_school_district_boundaries(boundary_path)
+    geometries = [boundary["geometry"] for boundary in boundaries]
+    tree = STRtree(geometries)
+
+    valid_coordinate_mask = (
+        data["Latitude"].notna()
+        & data["Longitude"].notna()
+        & data["Latitude"].between(32, 43)
+        & data["Longitude"].between(-125, -114)
+    )
+    unique_coordinates = (
+        data.loc[valid_coordinate_mask, ["Latitude", "Longitude"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
+    )
+
+    rows = []
+    for row in unique_coordinates.itertuples(index=False):
+        latitude = float(row.Latitude)
+        longitude = float(row.Longitude)
+        point = Point(longitude, latitude)
+        candidate_indexes = tree.query(point)
+        matches = [
+            boundaries[int(index)]
+            for index in candidate_indexes
+            if geometries[int(index)].covers(point)
+        ]
+        primary = choose_primary_district(matches)
+        by_type = {
+            str(match.get("DistrictType")): match.get("DistrictName")
+            for match in matches
+            if match.get("DistrictType") and match.get("DistrictName")
+        }
+        rows.append(
+            {
+                "Latitude": latitude,
+                "Longitude": longitude,
+                "school_district_name": (
+                    primary.get("DistrictName") if primary else pd.NA
+                ),
+                "school_district_type": (
+                    primary.get("DistrictType") if primary else pd.NA
+                ),
+                "school_district_county": (
+                    primary.get("CountyName") if primary else pd.NA
+                ),
+                "school_district_cdcode": (
+                    primary.get("CDCode") if primary else pd.NA
+                ),
+                "school_district_match_count": len(matches),
+                "elementary_school_district_boundary": by_type.get(
+                    "Elementary",
+                    pd.NA,
+                ),
+                "high_school_district_boundary": by_type.get("High", pd.NA),
+                "unified_school_district_boundary": by_type.get("Unified", pd.NA),
+            }
+        )
+
+    match_frame = pd.DataFrame(rows)
+    if match_frame.empty:
+        data["school_district_match_count"] = 0
+        data["school_district_source"] = "no valid coordinates for boundary join"
+        return data
+
+    data = data.merge(match_frame, on=["Latitude", "Longitude"], how="left")
+    data["school_district_match_count"] = (
+        data["school_district_match_count"].fillna(0).astype("Int64")
+    )
+    data["school_district_source"] = "CA School District Areas 2024-25 boundary join"
+    data.loc[
+        data["school_district_match_count"].eq(0),
+        "school_district_source",
+    ] = "no boundary match from valid Latitude/Longitude"
+    data.loc[
+        data["Latitude"].isna() | data["Longitude"].isna(),
+        "school_district_source",
+    ] = "missing Latitude/Longitude"
+
+    fallback = first_non_null_text(
+        data,
+        [
+            "HighSchoolDistrict",
+            "ElementarySchoolDistrict",
+            "MiddleOrJuniorSchoolDistrict",
+        ],
+    )
+    data["school_district_name"] = data["school_district_name"].fillna(fallback)
+    data.loc[
+        data["school_district_match_count"].eq(0) & fallback.notna(),
+        "school_district_source",
+    ] = "MLS district field fallback after no boundary match"
+
+    return data
+
+
+def add_engineered_metrics(frame: pd.DataFrame, boundary_path: Path) -> pd.DataFrame:
     data = frame.copy()
 
     for column in DATE_COLUMNS:
@@ -141,20 +309,7 @@ def add_engineered_metrics(frame: pd.DataFrame) -> pd.DataFrame:
         data["CloseDate"] - data["PurchaseContractDate"]
     ).dt.days.astype("Int64")
 
-    # Boundary-based enrichment can be added later from the CA school district
-    # area layer. For the current deliverable, use the district fields already
-    # present in the MLS extract so the output remains analysis-ready.
-    district_candidates = [
-        "HighSchoolDistrict",
-        "ElementarySchoolDistrict",
-        "MiddleOrJuniorSchoolDistrict",
-    ]
-    data["school_district_name"] = first_non_null_text(data, district_candidates)
-    data["school_district_source"] = "not available in MLS fields"
-    data.loc[
-        data["school_district_name"].notna(),
-        "school_district_source",
-    ] = "MLS district field fallback"
+    data = add_school_district_boundaries(data, boundary_path)
 
     return data
 
@@ -209,6 +364,32 @@ def office_competitive_summary(data: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def school_district_summary(data: pd.DataFrame) -> pd.DataFrame:
+    return (
+        data.groupby(
+            [
+                "school_district_name",
+                "school_district_type",
+                "school_district_county",
+            ],
+            dropna=False,
+        )
+        .agg(
+            sold_records=("ListingKey", "count"),
+            median_close_price=("ClosePrice", "median"),
+            average_close_price=("ClosePrice", "mean"),
+            median_price_per_sqft=("price_per_sqft", "median"),
+            median_days_on_market=("days_on_market_metric", "median"),
+            median_close_to_original_list_ratio=(
+                "close_to_original_list_ratio",
+                "median",
+            ),
+        )
+        .reset_index()
+        .sort_values("sold_records", ascending=False)
+    )
+
+
 def data_type_confirmations(data: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(
         {
@@ -229,6 +410,12 @@ def quality_counts(data: pd.DataFrame) -> dict[str, int]:
         "rows_with_contract_to_close_days": int(data["contract_to_close_days"].notna().sum()),
         "rows_with_school_district_name": int(data["school_district_name"].notna().sum()),
         "rows_missing_school_district_name": int(data["school_district_name"].isna().sum()),
+        "rows_with_boundary_school_district_match": int(
+            data["school_district_match_count"].fillna(0).gt(0).sum()
+        ),
+        "rows_with_multiple_boundary_district_matches": int(
+            data["school_district_match_count"].fillna(0).gt(1).sum()
+        ),
     }
 
     for column in [
@@ -251,9 +438,11 @@ def write_work_report(
     counts: dict[str, int],
     county_summary: pd.DataFrame,
     property_summary: pd.DataFrame,
+    school_summary: pd.DataFrame,
 ) -> None:
     top_county = county_summary.iloc[0]
     top_property = property_summary.iloc[0]
+    top_school = school_summary.dropna(subset=["school_district_name"]).iloc[0]
 
     report = f"""# Week 6 Work Report - Feature Engineering and Market Metrics
 
@@ -278,7 +467,9 @@ Week 6 requires engineered market metrics for Tableau analysis: price ratio, clo
 - Created `close_year`, `close_month`, and `YrMo` from `CloseDate`.
 - Created `listing_to_contract_days` from `PurchaseContractDate - ListingContractDate`.
 - Created `contract_to_close_days` from `CloseDate - PurchaseContractDate`.
-- Added `school_district_name` from available MLS district fields, preferring `HighSchoolDistrict`, then `ElementarySchoolDistrict`, then `MiddleOrJuniorSchoolDistrict`.
+- Added school district fields from the California School District Areas 2024-25 boundary file using each property's `Latitude` and `Longitude`.
+- Created `elementary_school_district_boundary`, `high_school_district_boundary`, and `unified_school_district_boundary` because the state layer contains overlapping district types.
+- Created `school_district_name` as the primary boundary match, preferring Unified, then Elementary, then High district records.
 
 ## Quality Checks
 
@@ -289,6 +480,8 @@ Week 6 requires engineered market metrics for Tableau analysis: price ratio, clo
 - Rows with contract-to-close days: {counts["rows_with_contract_to_close_days"]:,}
 - Rows with school district name: {counts["rows_with_school_district_name"]:,}
 - Rows missing school district name: {counts["rows_missing_school_district_name"]:,}
+- Rows with boundary-derived school district match: {counts["rows_with_boundary_school_district_match"]:,}
+- Rows with multiple boundary district matches: {counts["rows_with_multiple_boundary_district_matches"]:,}
 
 ## Geographic Data Quality
 
@@ -297,12 +490,15 @@ Week 6 requires engineered market metrics for Tableau analysis: price ratio, clo
 - Positive longitude records: {counts.get("positive_longitude_flag", 0):,}
 - Out-of-state or implausible coordinate records: {counts.get("out_of_state_flag", 0):,}
 
-The Week 6 handbook references California School District Areas 2024-25 for latitude/longitude-based school district enrichment. The current local Python environment does not include geospatial join libraries such as geopandas or shapely, so the deliverable uses available MLS district fields and records the source in `school_district_source`. A later geospatial pass can replace or augment this field using the CA Open Data GeoJSON boundary layer.
+School district enrichment used the California School District Areas 2024-25 GeoJSON boundary layer from CA Open Data:
+
+`{SCHOOL_DISTRICT_BOUNDARY_URL}`
 
 ## Segment Summary Highlights
 
 - Largest county segment: {top_county["CountyOrParish"]} with {int(top_county["sold_records"]):,} sold records and median close price ${top_county["median_close_price"]:,.0f}.
 - Largest property segment: {top_property["PropertyType"]} / {top_property["PropertySubType"]} with {int(top_property["sold_records"]):,} sold records and median close price ${top_property["median_close_price"]:,.0f}.
+- Largest school district segment: {top_school["school_district_name"]} with {int(top_school["sold_records"]):,} sold records and median close price ${top_school["median_close_price"]:,.0f}.
 
 ## Deliverable Files
 
@@ -312,20 +508,21 @@ The Week 6 handbook references California School District Areas 2024-25 for lati
 - `Week6_CountyOrParish_Summary.csv`
 - `Week6_PropertyType_Summary.csv`
 - `Week6_OfficeCompetitiveSummary.csv`
+- `Week6_SchoolDistrict_Summary.csv`
 - `Week6_DataTypeConfirmations.csv`
 - `Week6_WorkReport.md`
 """
     output_path.write_text(report, encoding="utf-8")
 
 
-def run_week6(input_path: Path, output_directory: Path) -> None:
+def run_week6(input_path: Path, output_directory: Path, boundary_path: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
 
     source = pd.read_csv(input_path, low_memory=False)
     require_columns(source)
 
     rows_before = len(source)
-    engineered = add_engineered_metrics(source)
+    engineered = add_engineered_metrics(source, boundary_path)
     rows_after = len(engineered)
 
     engineered_path = output_directory / "Week6_EngineeredMarketMetrics.csv"
@@ -333,6 +530,7 @@ def run_week6(input_path: Path, output_directory: Path) -> None:
     county_summary_path = output_directory / "Week6_CountyOrParish_Summary.csv"
     property_summary_path = output_directory / "Week6_PropertyType_Summary.csv"
     office_summary_path = output_directory / "Week6_OfficeCompetitiveSummary.csv"
+    school_summary_path = output_directory / "Week6_SchoolDistrict_Summary.csv"
     dtypes_path = output_directory / "Week6_DataTypeConfirmations.csv"
     report_path = output_directory / "Week6_WorkReport.md"
 
@@ -354,6 +552,11 @@ def run_week6(input_path: Path, output_directory: Path) -> None:
         "CountyOrParish",
         "PropertySubType",
         "school_district_name",
+        "school_district_type",
+        "elementary_school_district_boundary",
+        "high_school_district_boundary",
+        "unified_school_district_boundary",
+        "school_district_source",
     ]
     engineered.loc[:, sample_columns].head(25).to_csv(sample_path, index=False)
 
@@ -365,6 +568,9 @@ def run_week6(input_path: Path, output_directory: Path) -> None:
 
     office_summary = office_competitive_summary(engineered)
     office_summary.to_csv(office_summary_path, index=False)
+
+    school_summary = school_district_summary(engineered)
+    school_summary.to_csv(school_summary_path, index=False)
 
     dtype_summary = data_type_confirmations(engineered)
     dtype_summary.to_csv(dtypes_path, index=False)
@@ -378,6 +584,7 @@ def run_week6(input_path: Path, output_directory: Path) -> None:
         counts,
         county_summary,
         property_summary,
+        school_summary,
     )
 
     print("WEEK 6 FEATURE ENGINEERING COMPLETE")
@@ -388,6 +595,7 @@ def run_week6(input_path: Path, output_directory: Path) -> None:
     print(f"County summary: {county_summary_path}")
     print(f"Property summary: {property_summary_path}")
     print(f"Office summary: {office_summary_path}")
+    print(f"School district summary: {school_summary_path}")
     print(f"Data type confirmations: {dtypes_path}")
     print(f"Work report: {report_path}")
 
@@ -409,12 +617,25 @@ def parse_arguments() -> argparse.Namespace:
         default=Path("."),
         help="Directory for Week 6 deliverables (default: current directory)",
     )
+    parser.add_argument(
+        "--school-district-boundaries",
+        type=Path,
+        default=Path("ca_school_district_areas_2024_25.geojson"),
+        help=(
+            "California School District Areas 2024-25 GeoJSON boundary file "
+            "(default: ca_school_district_areas_2024_25.geojson)"
+        ),
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_arguments()
-    run_week6(args.input_csv, args.output_directory)
+    run_week6(
+        args.input_csv,
+        args.output_directory,
+        args.school_district_boundaries,
+    )
 
 
 if __name__ == "__main__":
